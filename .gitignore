@@ -41,6 +41,7 @@ node_modules
 
 # IntelliJ
 .idea
+*.iml
 
 # Ansible
 ansible/environments/mac/hosts

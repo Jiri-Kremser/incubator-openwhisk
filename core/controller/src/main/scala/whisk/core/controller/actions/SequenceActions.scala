@@ -20,6 +20,7 @@ import java.time.Clock
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicReference
 
+import scala.collection.immutable.Map
 import scala.collection._
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
@@ -31,6 +32,7 @@ import scala.util.Success
 import akka.actor.ActorSystem
 import spray.json._
 import whisk.common.Logging
+import whisk.common.Tracing
 import whisk.common.TransactionId
 import whisk.core.controller.WhiskActionsApi._
 import whisk.core.controller.WhiskServices
@@ -65,7 +67,8 @@ protected[actions] trait SequenceActions {
         payload: Option[JsObject],
         timeout: FiniteDuration,
         blocking: Boolean,
-        cause: Option[ActivationId] = None)(
+        cause: Option[ActivationId] = None,
+        tracingMetadata: Option[Map[String, String]])(
             implicit transid: TransactionId): Future[(ActivationId, Option[WhiskActivation])]
 
     /**
@@ -90,7 +93,8 @@ protected[actions] trait SequenceActions {
         topmost: Boolean,
         components: Vector[FullyQualifiedEntityName],
         cause: Option[ActivationId],
-        atomicActionsCount: Int)(
+        atomicActionsCount: Int,
+        parentSpanMetadata: Option[Map[String, String]] = None)(
             implicit transid: TransactionId): Future[(ActivationId, Option[WhiskActivation], Int)] = {
         require(action.exec.kind == Exec.SEQUENCE, "this method requires an action sequence")
 
@@ -103,7 +107,7 @@ protected[actions] trait SequenceActions {
             completeSequenceActivation(
                 seqActivationId,
                 // the cause for the component activations is the current sequence
-                invokeSequenceComponents(user, action, seqActivationId, payload, components, cause = Some(seqActivationId), atomicActionsCount),
+                invokeSequenceComponents(user, action, seqActivationId, payload, components, cause = Some(seqActivationId), atomicActionsCount, parentSpanMetadata),
                 user, action, topmost, start, cause)
         }
 
@@ -235,7 +239,8 @@ protected[actions] trait SequenceActions {
         inputPayload: Option[JsObject],
         components: Vector[FullyQualifiedEntityName],
         cause: Option[ActivationId],
-        atomicActionCnt: Int)(
+        atomicActionCnt: Int,
+        parentSpanMetadata: Option[Map[String, String]] = None)(
             implicit transid: TransactionId): Future[SequenceAccounting] = {
 
         // For each action in the sequence, fetch any of its associated parameters (including package or binding).
@@ -255,12 +260,40 @@ protected[actions] trait SequenceActions {
             SequenceAccounting(atomicActionCnt, ActivationResponse.payloadPlaceholder(inputPayload))
         }
 
+        //start tracing span for sequence (there might be already a span that is need to be set as parrent!!)
+
+        logging.warn(this, s" starting span (seq)              -----------------------:           ")
+
+        val newTracingMetadata = cause.map(_ => scala.collection.mutable.HashMap.empty[String, String])
+//        val newTracingMetadata = Some(scala.collection.mutable.HashMap.empty[String, String])
+
+        logging.warn(this, s" parentSpanMetadata              -----------------------:           $parentSpanMetadata")
+        logging.warn(this, s" newTracingMetadata1             -----------------------:           $newTracingMetadata")
+
+
+        val spanMetadata = Tracing.SpanMetadata(seqAction.name.asString,
+                                                seqAction.namespace.asString,
+                                                user.subject.asString,
+                                                seqAction.rev.asString,
+                                                seqAction.version.toString)
+        val spanOption = Tracing.startSpan(spanMetadata, parentSpanMetadata, newTracingMetadata)
+
+        logging.warn(this, s" span started (seq)              -----------------------:           ")
+        logging.warn(this, s" cause (sequence case) -----------------------:            $cause")
+        logging.warn(this, s" newTracingMetadata2             -----------------------:           $newTracingMetadata")
+
+        val lastAction = resolvedFutureActions.last.andThen{case result => {
+            logging.warn(this, s" ending sequence span (result)1: -----------------------:           $result")
+            Tracing.endSpan(spanOption)
+            logging.warn(this, s" successfuly ended1: -----------------------:           ")
+            result
+        }}
         // execute the actions in sequential blocking fashion
-        resolvedFutureActions.foldLeft(initialAccounting) {
+        (resolvedFutureActions.dropRight(1) :+ lastAction).foldLeft(initialAccounting) {
             (accountingFuture, futureAction) =>
                 accountingFuture.flatMap { accounting =>
                     if (accounting.atomicActionCnt < actionSequenceLimit) {
-                        invokeNextAction(user, futureAction, accounting, cause).flatMap { accounting =>
+                        invokeNextAction(user, futureAction, accounting, cause, newTracingMetadata.map(_.toMap)).flatMap { accounting =>
                             if (!accounting.shortcircuit) {
                                 Future.successful(accounting)
                             } else {
@@ -277,8 +310,17 @@ protected[actions] trait SequenceActions {
             // turn the failed accounting back to success; this is the only possible failure
             // since all throwables are recovered with a failed accounting instance and this is
             // in turned boxed to FailedSequenceActivation
-            case FailedSequenceActivation(accounting) => Future.successful(accounting)
-        }
+            case FailedSequenceActivation(accounting) => {
+                logging.warn(this, s" ending sequence span (with error): -----------------------:           $accounting")
+                Tracing.endSpan(spanOption)
+                Future.successful(accounting)
+            }
+        }.andThen{case result => {
+            logging.warn(this, s" ending sequence span (result)1: -----------------------:           $result")
+            Tracing.endSpan(spanOption)
+            logging.warn(this, s" successfuly ended2: -----------------------:           ")
+            result
+        }}
     }
 
     /**
@@ -292,13 +334,15 @@ protected[actions] trait SequenceActions {
      * @param futureAction the future which fetches the action to be invoked from the db
      * @param accounting the state of the sequence activation, contains the dynamic activation count, logs and payload for the next action
      * @param cause the activation id of the first sequence containing this activations
+     *  todo: this
      * @return a future which resolves with updated accounting for a sequence, including the last result, duration, and activation ids
      */
     private def invokeNextAction(
         user: Identity,
         futureAction: Future[WhiskAction],
         accounting: SequenceAccounting,
-        cause: Option[ActivationId])(
+        cause: Option[ActivationId],
+        tracingMetadata: Option[Map[String, String]] = None)(
             implicit transid: TransactionId): Future[SequenceAccounting] = {
         futureAction.flatMap { action =>
             // the previous response becomes input for the next action in the sequence;
@@ -312,12 +356,12 @@ protected[actions] trait SequenceActions {
                 case SequenceExec(components) =>
                     logging.info(this, s"sequence invoking an enclosed sequence $action")
                     // call invokeSequence to invoke the inner sequence
-                    invokeSequence(user, action, inputPayload, blocking = true, topmost = false, components, cause, accounting.atomicActionCnt)
+                    invokeSequence(user, action, inputPayload, blocking = true, topmost = false, components, cause, accounting.atomicActionCnt, tracingMetadata)
                 case _ =>
                     // this is an invoke for an atomic action
                     logging.info(this, s"sequence invoking an enclosed atomic action $action")
                     val timeout = action.limits.timeout.duration + blockingInvokeGrace
-                    invokeSingleAction(user, action, inputPayload, timeout, blocking = true, cause) map {
+                    invokeSingleAction(user, action, inputPayload, timeout, blocking = true, cause = cause, tracingMetadata = tracingMetadata) map {
                         case (activationId, wskActivation) => (activationId, wskActivation, accounting.atomicActionCnt + 1)
                     }
             }

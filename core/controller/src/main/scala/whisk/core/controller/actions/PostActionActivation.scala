@@ -29,6 +29,7 @@ import whisk.core.controller.WhiskServices
 import whisk.core.entity._
 import whisk.http.Messages
 
+
 protected[core] trait PostActionActivation extends PrimitiveActions with SequenceActions {
     /** The core collections require backend services to be injected in this trait. */
     services: WhiskServices =>
@@ -48,12 +49,12 @@ protected[core] trait PostActionActivation extends PrimitiveActions with Sequenc
         action.exec match {
             // this is a topmost sequence
             case SequenceExec(components) =>
-                val futureSeqTuple = invokeSequence(user, action, payload, blocking, topmost = true, components, cause = None, 0)
+                val futureSeqTuple = invokeSequence(user, action, payload, blocking, topmost = true, components, cause = None, atomicActionsCount = 0, parentSpanMetadata = None)
                 futureSeqTuple map { case (activationId, wskActivation, _) => (activationId, wskActivation) }
             case supportedExec if !supportedExec.deprecated =>
                 val duration = action.limits.timeout.duration + blockingInvokeGrace
                 val timeout = waitOverride.getOrElse(duration)
-                invokeSingleAction(user, action, payload, timeout, blocking)
+                invokeSingleAction(user, action, payload, timeout, blocking, cause = None, tracingMetadata = None)
             case deprecatedExec =>
                 Future.failed(RejectRequest(BadRequest, Messages.runtimeDeprecated(deprecatedExec)))
         }

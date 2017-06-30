@@ -16,6 +16,7 @@
 
 package whisk.core.controller.actions
 
+import scala.collection.immutable.Map
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
 import scala.concurrent.Promise
@@ -85,7 +86,8 @@ protected[actions] trait PrimitiveActions {
         payload: Option[JsObject],
         timeout: FiniteDuration,
         blocking: Boolean,
-        cause: Option[ActivationId] = None)(
+        cause: Option[ActivationId],
+        tracingMetadata: Option[Map[String, String]])(
             implicit transid: TransactionId): Future[(ActivationId, Option[WhiskActivation])] = {
         require(action.exec.kind != Exec.SEQUENCE, "this method requires a primitive action")
 
@@ -99,7 +101,8 @@ protected[actions] trait PrimitiveActions {
             activationIdFactory.make(), // activation id created here
             activationNamespace = user.namespace.toPath,
             args,
-            cause = cause)
+            cause = cause,
+            tracingMetadata = tracingMetadata)
 
         val startActivation = transid.started(this, if (blocking) LoggingMarkers.CONTROLLER_ACTIVATION_BLOCKING else LoggingMarkers.CONTROLLER_ACTIVATION)
         val startLoadbalancer = transid.started(this, LoggingMarkers.CONTROLLER_LOADBALANCER, s"[POST] action activation id: ${message.activationId}")
